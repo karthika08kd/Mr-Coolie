@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "39469818906",
+    "project_id": "mrcoolie",
+    "storage_bucket": "mrcoolie.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:39469818906:android:f639f6f9e2c61c91509da3",
+        "android_client_info": {
+          "package_name": "com.example.coolie"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyBf7SCp-CDRvmYyHgIVGKqNmjOr7-7Wx7o"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}
