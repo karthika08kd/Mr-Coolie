@@ -28,5 +28,13 @@
 	<string>MainMenu</string>
 	<key>NSPrincipalClass</key>
 	<string>NSApplication</string>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>Microphone access lets you search for jobs using your voice.</string>
+	<key>NSSpeechRecognitionUsageDescription</key>
+	<string>Speech recognition converts your voice into a job search query.</string>
+	<key>NSLocationWhenInUseUsageDescription</key>
+	<string>Your location is shared with the employer for a job only when you turn on live sharing.</string>
+	<key>NSLocationUsageDescription</key>
+	<string>Your location is shared with the employer for a job only when you turn on live sharing.</string>
 </dict>
 </plist>

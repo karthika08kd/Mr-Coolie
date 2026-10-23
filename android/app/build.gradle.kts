@@ -1,3 +1,5 @@
+import java.util.Properties
+
 plugins {
     id("com.android.application")
     // START: FlutterFire Configuration
@@ -30,6 +32,12 @@ android {
         // flag during build.
         versionCode = flutter.versionCode
         versionName = flutter.versionName
+        val mapsProperties = Properties()
+        val mapsPropertiesFile = rootProject.file("local.properties")
+        if (mapsPropertiesFile.exists()) {
+            mapsPropertiesFile.inputStream().use { mapsProperties.load(it) }
+        }
+        manifestPlaceholders["MAPS_API_KEY"] = mapsProperties.getProperty("maps.api.key", "")
     }
 
     buildTypes {

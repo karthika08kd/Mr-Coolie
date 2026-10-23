@@ -58,6 +58,7 @@ build/
 # Android
 android/.gradle/
 android/local.properties
+ios/Flutter/Maps.local.xcconfig
 android/app/debug/
 android/app/profile/
 android/app/release/

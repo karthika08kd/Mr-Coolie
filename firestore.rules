@@ -1,0 +1,709 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    function profilePath(uid) {
+      return /databases/$(database)/documents/users/$(uid);
+    }
+
+    function hasRole(role) {
+      return signedIn()
+        && exists(profilePath(request.auth.uid))
+        && get(profilePath(request.auth.uid)).data.role == role;
+    }
+
+    function hasRoleAfter(role) {
+      return signedIn()
+        && existsAfter(profilePath(request.auth.uid))
+        && getAfter(profilePath(request.auth.uid)).data.role == role;
+    }
+
+    function validRole(role) {
+      return role in ['worker', 'employer', 'customer'];
+    }
+
+    // Collection-group queries must have a rule that matches the collection
+    // group path. Keep these reads restricted to documents owned by the
+    // authenticated worker; employers continue to use job-scoped reads.
+    match /{path=**}/applications/{workerUid} {
+      allow read: if signedIn()
+        && resource.data.workerUid == request.auth.uid;
+    }
+
+    match /{path=**}/payments/{paymentId} {
+      allow read: if signedIn()
+        && resource.data.workerUid == request.auth.uid;
+    }
+
+    match /users/{uid} {
+      allow create: if signedIn()
+        && request.auth.uid == uid
+        && request.resource.data.uid == uid
+        && validRole(request.resource.data.role);
+
+      allow read: if signedIn() && request.auth.uid == uid;
+
+      // Roles are immutable from the client. Role changes require a trusted admin flow.
+      allow update: if signedIn()
+        && request.auth.uid == uid
+        && request.resource.data.role == resource.data.role
+        && request.resource.data.uid == resource.data.uid
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+          'name', 'email', 'phoneNumber', 'location', 'department', 'skill',
+          'preferredLanguage', 'updatedAt'
+        ]);
+
+      allow delete: if false;
+
+      match /notifications/{notificationId} {
+        function jobPath() {
+          return /databases/$(database)/documents/jobs/$(request.resource.data.jobId);
+        }
+
+        function applicationPath() {
+          return /databases/$(database)/documents/jobs/$(request.resource.data.jobId)/applications/$(request.auth.uid);
+        }
+
+        allow read: if signedIn() && request.auth.uid == uid;
+
+        // A worker can notify only the employer of the job they applied to.
+        // The application is created first so notification delivery failures
+        // never discard an otherwise valid job application.
+        allow create: if hasRole('worker')
+          && request.auth.uid == request.resource.data.workerUid
+          && request.resource.data.employerUid == uid
+          && uid != request.auth.uid
+          && request.resource.data.type == 'job_application'
+          && notificationId == request.resource.data.jobId + '_' + request.auth.uid
+          && exists(jobPath())
+          && get(jobPath()).data.employerUid == uid
+          && exists(applicationPath())
+          && get(applicationPath()).data.status == 'applied'
+          && request.resource.data.createdAt == request.time
+          && request.resource.data.read == false
+          && request.resource.data.keys().hasOnly([
+            'type', 'jobId', 'jobTitle', 'workerUid', 'workerName',
+            'employerUid', 'createdAt', 'read'
+          ]);
+
+        allow update: if signedIn()
+          && request.auth.uid == uid
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['read', 'readAt'])
+          && resource.data.read == false
+          && request.resource.data.read == true
+          && request.resource.data.readAt == request.time;
+
+        allow delete: if false;
+      }
+    }
+
+    // Only trusted server code may create transaction records. A worker can
+    // read their own verified payment history from this collection.
+    match /transactions/{transactionId} {
+      allow read: if signedIn() && resource.data.workerUid == request.auth.uid;
+      allow create, update, delete: if false;
+    }
+
+    match /publicWorkers/{uid} {
+      allow read: if signedIn()
+        && (request.auth.uid == uid || hasRole('employer') || hasRole('customer'));
+      allow create: if signedIn()
+        && request.auth.uid == uid
+        && hasRoleAfter('worker')
+        && request.resource.data.uid == uid
+        && request.resource.data.keys().hasOnly([
+          'uid', 'name', 'location', 'department', 'skill', 'available',
+          'preferredLanguage', 'createdAt', 'updatedAt'
+        ]);
+      allow update: if signedIn()
+        && request.auth.uid == uid
+        && hasRole('worker')
+        && request.resource.data.uid == resource.data.uid
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+          'name', 'location', 'department', 'skill', 'available',
+          'preferredLanguage', 'updatedAt', 'mapVisible', 'latitude', 'longitude'
+        ])
+        && (!('mapVisible' in request.resource.data)
+          || request.resource.data.mapVisible is bool)
+        && ((request.resource.data.get('mapVisible', false) == true
+            && request.resource.data.latitude is number
+            && request.resource.data.longitude is number
+            && request.resource.data.latitude >= -90
+            && request.resource.data.latitude <= 90
+            && request.resource.data.longitude >= -180
+            && request.resource.data.longitude <= 180)
+          || (request.resource.data.get('mapVisible', false) == false
+            && !('latitude' in request.resource.data)
+            && !('longitude' in request.resource.data)));
+      allow delete: if false;
+
+      match /contactRequests/{customerUid} {
+        function workerProfilePath() {
+          return /databases/$(database)/documents/publicWorkers/$(uid);
+        }
+
+        allow read: if signedIn()
+          && (request.auth.uid == uid || request.auth.uid == customerUid);
+
+        allow create: if hasRole('customer')
+          && request.auth.uid == customerUid
+          && request.resource.data.customerUid == customerUid
+          && request.resource.data.workerUid == uid
+          && request.resource.data.status == 'pending'
+          && request.resource.data.createdAt == request.time
+          && request.resource.data.serviceTitle is string
+          && request.resource.data.serviceTitle.size() > 0
+          && request.resource.data.serviceTitle.size() <= 80
+          && request.resource.data.serviceDetails is string
+          && request.resource.data.serviceDetails.size() <= 500
+          && request.resource.data.serviceLocation is string
+          && request.resource.data.serviceLocation.size() > 0
+          && request.resource.data.serviceLocation.size() <= 160
+          && request.resource.data.budgetNote is string
+          && request.resource.data.budgetNote.size() <= 32
+          && request.resource.data.quoteRequired == true
+          && request.resource.data.keys().hasOnly([
+            'customerUid', 'customerName', 'workerUid', 'status', 'createdAt',
+            'serviceTitle', 'serviceDetails', 'serviceLocation', 'budgetNote',
+            'quoteRequired'
+          ])
+          && get(workerProfilePath()).data.available == true;
+
+        // Only the worker can approve or decline. Sharing a number is optional
+        // and only included when the worker explicitly chooses that action.
+        allow update: if (
+            hasRole('worker')
+            && request.auth.uid == uid
+            && resource.data.status == 'pending'
+            && request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+              'status', 'updatedAt', 'sharedPhoneNumber'
+            ])
+            && request.resource.data.status in ['accepted', 'rejected']
+            && request.resource.data.updatedAt == request.time
+            && (request.resource.data.status != 'accepted'
+              || !('sharedPhoneNumber' in request.resource.data)
+              || (request.resource.data.sharedPhoneNumber is string
+                && request.resource.data.sharedPhoneNumber.size() <= 32))
+          ) || (
+            hasRole('customer')
+            && request.auth.uid == customerUid
+            && resource.data.status == 'rejected'
+            && request.resource.data.status == 'pending'
+            && request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+              'status', 'updatedAt', 'serviceTitle', 'serviceDetails',
+              'serviceLocation', 'budgetNote', 'quoteRequired'
+            ])
+            && request.resource.data.serviceTitle is string
+            && request.resource.data.serviceTitle.size() > 0
+            && request.resource.data.serviceTitle.size() <= 80
+            && request.resource.data.serviceDetails is string
+            && request.resource.data.serviceDetails.size() <= 500
+            && request.resource.data.serviceLocation is string
+            && request.resource.data.serviceLocation.size() > 0
+            && request.resource.data.serviceLocation.size() <= 160
+            && request.resource.data.budgetNote is string
+            && request.resource.data.budgetNote.size() <= 32
+            && request.resource.data.quoteRequired == true
+            && request.resource.data.updatedAt == request.time
+          );
+
+        allow delete: if false;
+      }
+    }
+
+    // Live coordinates exist only while a worker explicitly shares for an
+    // assigned job. Employer reads are limited to that same job and employer.
+    match /liveLocations/{jobId} {
+      function locationPath() {
+        return /databases/$(database)/documents/liveLocations/$(jobId);
+      }
+
+      function jobPath() {
+        return /databases/$(database)/documents/jobs/$(jobId);
+      }
+
+      function workerOwnsAssignedJob() {
+        return signedIn()
+          && get(jobPath()).data.status == 'assigned'
+          && get(jobPath()).data.acceptedWorkerUid == request.auth.uid;
+      }
+
+      function workerCanStopAfterCompletion() {
+        return signedIn()
+          && get(jobPath()).data.status == 'completed'
+          && get(jobPath()).data.acceptedWorkerUid == request.auth.uid;
+      }
+
+      allow get: if signedIn()
+        && ((hasRole('worker')
+            && (workerOwnsAssignedJob() || workerCanStopAfterCompletion())
+            && (!exists(locationPath()) || resource.data.workerUid == request.auth.uid))
+          || (hasRole('employer')
+            && get(jobPath()).data.employerUid == request.auth.uid
+            && get(jobPath()).data.status == 'assigned'
+            && ((!exists(locationPath()))
+              || (resource.data.sharing == true
+                && resource.data.employerUid == request.auth.uid
+                && resource.data.updatedAt is timestamp
+                && resource.data.updatedAt > request.time - duration.value(2, 'm')
+                && get(jobPath()).data.acceptedWorkerUid == resource.data.workerUid))));
+
+      allow list: if signedIn()
+        && ((hasRole('worker') && resource.data.workerUid == request.auth.uid)
+          || (hasRole('employer')
+            && resource.data.sharing == true
+            && resource.data.employerUid == request.auth.uid
+            && resource.data.updatedAt is timestamp
+            && resource.data.updatedAt > request.time - duration.value(2, 'm')
+            && get(jobPath()).data.employerUid == request.auth.uid
+            && get(jobPath()).data.acceptedWorkerUid == resource.data.workerUid));
+
+      allow create: if hasRole('worker')
+        && workerOwnsAssignedJob()
+        && request.resource.data.workerUid == request.auth.uid
+        && request.resource.data.employerUid == get(jobPath()).data.employerUid
+        && request.resource.data.sharing == true
+        && request.resource.data.location is latlng
+        && request.resource.data.updatedAt == request.time
+        && request.resource.data.keys().hasOnly([
+          'workerUid', 'employerUid', 'location', 'sharing', 'updatedAt'
+        ]);
+
+      allow update: if hasRole('worker')
+        && (workerOwnsAssignedJob()
+          || (workerCanStopAfterCompletion() && request.resource.data.sharing == false))
+        && request.resource.data.workerUid == resource.data.workerUid
+        && request.resource.data.workerUid == request.auth.uid
+        && request.resource.data.employerUid == get(jobPath()).data.employerUid
+        && request.resource.data.location is latlng
+        && request.resource.data.sharing is bool
+        && request.resource.data.updatedAt == request.time
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+          'location', 'sharing', 'updatedAt'
+        ]);
+
+      allow delete: if false;
+    }
+
+    // Customer repair requests are separate from employer job posts. Signed-in
+    // workers can discover open requests; only the owning customer sees closed
+    // requests and the identities of people who applied.
+    match /serviceRequests/{requestId} {
+      function isRequestOwner() {
+        return signedIn() && resource.data.customerUid == request.auth.uid;
+      }
+
+      function workerMatchesServiceRequest() {
+        let worker = get(profilePath(request.auth.uid)).data;
+        let workerDepartment = worker.get('department', '');
+        let serviceDepartment = resource.data.get('department', '');
+        let workerSkill = worker.get('skill', '');
+        let serviceSkill = resource.data.get('skill', '');
+        let sameDepartment = workerDepartment is string
+          && serviceDepartment is string
+          && workerDepartment.trim().size() > 0
+          && serviceDepartment.trim().size() > 0
+          && workerDepartment.trim().lower() == serviceDepartment.trim().lower();
+        let sameSkill = workerSkill is string && serviceSkill is string
+          && workerSkill.trim().size() > 0
+          && serviceSkill.trim().size() > 0
+          && workerSkill.trim().lower() == serviceSkill.trim().lower();
+        return workerDepartment is string
+          && serviceDepartment is string
+          && workerDepartment.trim().size() > 0
+          && serviceDepartment.trim().size() > 0
+          ? sameDepartment
+          : sameSkill;
+      }
+
+      function workerApplicationPath(workerUid) {
+        return /databases/$(database)/documents/serviceRequests/$(requestId)/applications/$(workerUid);
+      }
+
+      allow read: if signedIn()
+        && (resource.data.status == 'open' || isRequestOwner());
+
+      allow create: if hasRole('customer')
+        && request.resource.data.customerUid == request.auth.uid
+        && request.resource.data.status == 'open'
+        && request.resource.data.title is string
+        && request.resource.data.title.size() > 0
+        && request.resource.data.title.size() <= 80
+        && request.resource.data.description is string
+        && request.resource.data.description.size() <= 500
+        && request.resource.data.department is string
+        && request.resource.data.skill is string
+        && request.resource.data.location is string
+        && request.resource.data.location.size() > 0
+        && request.resource.data.location.size() <= 160
+        && request.resource.data.budgetNote is string
+        && request.resource.data.budgetNote.size() <= 32
+        && request.resource.data.latitude is number
+        && request.resource.data.longitude is number
+        && request.resource.data.latitude >= -90
+        && request.resource.data.latitude <= 90
+        && request.resource.data.longitude >= -180
+        && request.resource.data.longitude <= 180
+        && request.resource.data.radiusKm is number
+        && request.resource.data.radiusKm in [5, 10, 15, 20]
+        && request.resource.data.createdAt == request.time
+        && request.resource.data.updatedAt == request.time
+        && request.resource.data.keys().hasOnly([
+          'customerUid', 'customerName', 'title', 'description', 'department',
+          'skill', 'location', 'budgetNote', 'latitude', 'longitude', 'radiusKm',
+          'status', 'createdAt', 'updatedAt'
+        ]);
+
+      allow update: if (isRequestOwner()
+          && resource.data.status == 'open'
+          && request.resource.data.status == 'closed'
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status', 'updatedAt'])
+          && request.resource.data.updatedAt == request.time)
+        || (hasRole('worker')
+          && resource.data.status == 'open'
+          && request.resource.data.status == 'assigned'
+          && request.resource.data.acceptedWorkerUid == request.auth.uid
+          && request.resource.data.acceptedWorkerName is string
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+            'status', 'acceptedWorkerUid', 'acceptedWorkerName', 'updatedAt'
+          ])
+          && request.resource.data.updatedAt == request.time
+          && workerMatchesServiceRequest()
+          && getAfter(workerApplicationPath(request.auth.uid)).data.status == 'accepted');
+      allow delete: if false;
+
+      match /applications/{workerUid} {
+        function requestPath() {
+          return /databases/$(database)/documents/serviceRequests/$(requestId);
+        }
+
+        function matchingWorkerProfile() {
+          let worker = get(profilePath(request.auth.uid)).data;
+          let serviceRequest = get(requestPath()).data;
+          let workerDepartment = worker.get('department', '');
+          let serviceDepartment = serviceRequest.get('department', '');
+          let workerSkill = worker.get('skill', '');
+          let serviceSkill = serviceRequest.get('skill', '');
+          let sameSkill = workerSkill is string && serviceSkill is string
+            && workerSkill.trim().size() > 0
+            && serviceSkill.trim().size() > 0
+            && workerSkill.trim().lower() == serviceSkill.trim().lower();
+          let sameDepartment = workerDepartment is string && serviceDepartment is string
+            && workerDepartment.trim().size() > 0
+            && serviceDepartment.trim().size() > 0
+            && workerDepartment.trim().lower() == serviceDepartment.trim().lower();
+          let requestHasDepartment = serviceDepartment is string
+            && serviceDepartment.trim().size() > 0;
+          let workerHasDepartment = workerDepartment is string
+            && workerDepartment.trim().size() > 0;
+          return requestHasDepartment && workerHasDepartment
+            ? sameDepartment
+            : sameSkill;
+        }
+
+        allow read: if signedIn()
+          && (get(requestPath()).data.customerUid == request.auth.uid
+            || request.auth.uid == workerUid);
+
+        allow create: if hasRole('worker')
+          && request.auth.uid == workerUid
+          && get(requestPath()).data.status == 'open'
+          && matchingWorkerProfile()
+          && request.resource.data.workerUid == workerUid
+          && request.resource.data.status in ['accepted', 'rejected']
+          && request.resource.data.createdAt == request.time
+          && (request.resource.data.status == 'accepted'
+            ? getAfter(requestPath()).data.status == 'assigned'
+              && getAfter(requestPath()).data.acceptedWorkerUid == workerUid
+            : getAfter(requestPath()).data.status == 'open')
+          && request.resource.data.keys().hasOnly([
+            'workerUid', 'workerName', 'department', 'skill', 'location',
+            'status', 'createdAt'
+          ]);
+
+        allow update, delete: if false;
+      }
+    }
+
+    match /jobs/{jobId} {
+      allow read: if signedIn()
+        && (resource.data.status == 'open'
+          || resource.data.employerUid == request.auth.uid
+          || (resource.data.status == 'assigned'
+            || resource.data.status == 'completed')
+            && resource.data.acceptedWorkerUid == request.auth.uid);
+
+      allow create: if hasRole('employer')
+        && request.resource.data.employerUid == request.auth.uid
+        && request.resource.data.status == 'open'
+        && request.resource.data.keys().hasOnly([
+          'title', 'description', 'location', 'department', 'skill', 'wage',
+          'payment', 'duration', 'employerUid', 'employerName', 'status',
+          'applicants', 'acceptedWorkerUid', 'createdAt', 'updatedAt', 'latitude', 'longitude'
+        ])
+        && (!('latitude' in request.resource.data) || request.resource.data.latitude is number)
+        && (!('longitude' in request.resource.data) || request.resource.data.longitude is number)
+        && (('latitude' in request.resource.data) == ('longitude' in request.resource.data));
+
+      allow update: if hasRole('employer')
+        && resource.data.employerUid == request.auth.uid
+        && request.resource.data.employerUid == resource.data.employerUid
+        && (
+          (
+            request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+              'status', 'acceptedWorkerUid', 'updatedAt'
+            ])
+            && (
+              (request.resource.data.status in ['open', 'closed']
+                && request.resource.data.acceptedWorkerUid == resource.data.acceptedWorkerUid
+                && (request.resource.data.status == 'closed'
+                  || resource.data.acceptedWorkerUid == null))
+              || (resource.data.status == 'open'
+                && request.resource.data.status == 'assigned'
+                && request.resource.data.acceptedWorkerUid is string
+                && existsAfter(/databases/$(database)/documents/jobs/$(jobId)/applications/$(request.resource.data.acceptedWorkerUid))
+                && getAfter(/databases/$(database)/documents/jobs/$(jobId)/applications/$(request.resource.data.acceptedWorkerUid)).data.status == 'accepted')
+              || (resource.data.status == 'assigned'
+                && request.resource.data.status == 'completed'
+                && request.resource.data.acceptedWorkerUid == resource.data.acceptedWorkerUid
+                && existsAfter(/databases/$(database)/documents/jobs/$(jobId)/applications/$(resource.data.acceptedWorkerUid))
+                && getAfter(/databases/$(database)/documents/jobs/$(jobId)/applications/$(resource.data.acceptedWorkerUid)).data.status == 'completed')
+            )
+          )
+          || (
+            resource.data.status == 'completed'
+            && request.resource.data.status == 'completed'
+            && !('wage' in resource.data)
+            && !('payment' in resource.data)
+            && request.resource.data.wage is number
+            && request.resource.data.wage > 0
+            && request.resource.data.wage <= 10000000
+            && request.resource.data.payment == request.resource.data.wage
+            && request.resource.data.updatedAt == request.time
+            && request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+              'wage', 'payment', 'updatedAt'
+            ])
+          )
+        );
+
+      allow delete: if false;
+
+      // The worker's UPI address is scoped to a job and visible only to the
+      // two participants. The app does not expose it on public worker cards.
+      match /payoutProfiles/{workerUid} {
+        function jobPath() {
+          return /databases/$(database)/documents/jobs/$(jobId);
+        }
+
+        function payoutPath() {
+          return /databases/$(database)/documents/jobs/$(jobId)/payoutProfiles/$(workerUid);
+        }
+
+        allow read: if signedIn()
+          && ((!exists(payoutPath())
+              && (request.auth.uid == workerUid
+                || (hasRole('employer')
+                  && request.auth.uid == get(jobPath()).data.employerUid)))
+            || resource.data.workerUid == request.auth.uid
+            || (hasRole('employer')
+              && request.auth.uid == get(jobPath()).data.employerUid));
+
+        allow create, update: if hasRole('worker')
+          && request.auth.uid == workerUid
+          && get(jobPath()).data.acceptedWorkerUid == workerUid
+          && get(jobPath()).data.status in ['assigned', 'completed']
+          && request.resource.data.workerUid == workerUid
+          && request.resource.data.upiId is string
+          && request.resource.data.upiId.matches('^[A-Za-z0-9._-]{2,256}@[A-Za-z0-9._-]{2,64}$')
+          && request.resource.data.updatedAt == request.time
+          && request.resource.data.keys().hasOnly(['workerUid', 'upiId', 'updatedAt']);
+
+        allow delete: if false;
+      }
+
+      // UPI transfers go directly from the employer to the worker's bank.
+      // This document records the payer's report and recipient's confirmation;
+      // it is not a gateway-verified bank statement or wallet balance.
+      match /payments/{paymentId} {
+        function jobPath() {
+          return /databases/$(database)/documents/jobs/$(jobId);
+        }
+
+        function paymentPath() {
+          return /databases/$(database)/documents/jobs/$(jobId)/payments/$(paymentId);
+        }
+
+        allow read: if signedIn()
+          && ((!exists(paymentPath())
+              && (request.auth.uid == get(jobPath()).data.acceptedWorkerUid
+                || (hasRole('employer')
+                  && request.auth.uid == get(jobPath()).data.employerUid)))
+            || resource.data.workerUid == request.auth.uid
+            || (hasRole('employer')
+              && request.auth.uid == get(jobPath()).data.employerUid));
+
+        allow create: if hasRole('employer')
+          && paymentId == 'upi'
+          && !exists(/databases/$(database)/documents/jobs/$(jobId)/payments/upi)
+          && get(jobPath()).data.status == 'completed'
+          && get(jobPath()).data.employerUid == request.auth.uid
+          && request.resource.data.jobId == jobId
+          && request.resource.data.employerUid == request.auth.uid
+          && request.resource.data.payerUid == request.auth.uid
+          && request.resource.data.workerUid == get(jobPath()).data.acceptedWorkerUid
+          && (request.resource.data.amount == get(jobPath()).data.wage
+            || request.resource.data.amount == get(jobPath()).data.payment)
+          && request.resource.data.amount is number
+          && request.resource.data.amount > 0
+          && request.resource.data.method == 'direct_upi_qr'
+          && request.resource.data.status == 'payer_reported'
+          && request.resource.data.paymentReference is string
+          && request.resource.data.paymentReference.size() <= 64
+          && request.resource.data.createdAt == request.time
+          && request.resource.data.updatedAt == request.time
+          && request.resource.data.keys().hasAll([
+            'jobId', 'jobTitle', 'workerUid', 'employerUid', 'payerUid',
+            'amount', 'method', 'paymentReference', 'status', 'createdAt', 'updatedAt'
+          ])
+          && request.resource.data.keys().hasOnly([
+            'jobId', 'jobTitle', 'workerUid', 'employerUid', 'payerUid',
+            'amount', 'method', 'paymentReference', 'status', 'createdAt', 'updatedAt'
+          ]);
+
+        allow update: if hasRole('worker')
+          && request.auth.uid == get(jobPath()).data.acceptedWorkerUid
+          && resource.data.workerUid == request.auth.uid
+          && resource.data.status == 'payer_reported'
+          && request.resource.data.status == 'worker_confirmed'
+          && request.resource.data.workerConfirmedAt == request.time
+          && request.resource.data.updatedAt == request.time
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+            'status', 'workerConfirmedAt', 'updatedAt'
+          ]);
+
+        allow delete: if false;
+      }
+
+      match /ratings/{raterUid} {
+        function jobPath() {
+          return /databases/$(database)/documents/jobs/$(jobId);
+        }
+
+        function isJobParticipant() {
+          return signedIn()
+            && (get(jobPath()).data.employerUid == request.auth.uid
+              || get(jobPath()).data.acceptedWorkerUid == request.auth.uid);
+        }
+
+        allow read: if isJobParticipant();
+
+        allow create: if signedIn()
+          && request.auth.uid == raterUid
+          && get(jobPath()).data.status == 'completed'
+          && request.resource.data.raterUid == request.auth.uid
+          && request.resource.data.createdAt == request.time
+          && request.resource.data.score is int
+          && request.resource.data.score >= 1
+          && request.resource.data.score <= 5
+          && request.resource.data.keys().hasOnly(['raterUid', 'ratedUid', 'score', 'createdAt'])
+          && ((hasRole('employer')
+              && get(jobPath()).data.employerUid == request.auth.uid
+              && request.resource.data.ratedUid == get(jobPath()).data.acceptedWorkerUid)
+            || (hasRole('worker')
+              && get(jobPath()).data.acceptedWorkerUid == request.auth.uid
+              && request.resource.data.ratedUid == get(jobPath()).data.employerUid));
+
+        allow update, delete: if false;
+      }
+
+      match /views/{workerUid} {
+        function jobPath() {
+          return /databases/$(database)/documents/jobs/$(jobId);
+        }
+
+        allow read: if signedIn()
+          && (get(jobPath()).data.employerUid == request.auth.uid
+            || request.auth.uid == workerUid);
+
+        allow create: if hasRole('worker')
+          && request.auth.uid == workerUid
+          && request.resource.data.workerUid == workerUid
+          && request.resource.data.createdAt == request.time
+          && request.resource.data.keys().hasOnly(['workerUid', 'createdAt'])
+          && get(jobPath()).data.status == 'open'
+          && get(profilePath(request.auth.uid)).data.department == get(jobPath()).data.department;
+
+        allow update, delete: if false;
+      }
+
+      match /applications/{workerUid} {
+        function jobPath() {
+          return /databases/$(database)/documents/jobs/$(jobId);
+        }
+
+        function workerMatchesJobDepartment() {
+          let profile = get(profilePath(request.auth.uid)).data;
+          let job = get(jobPath()).data;
+          let workerDepartment = profile.get('department', '');
+          let jobDepartment = job.get('department', '');
+          let workerSkill = profile.get('skill', '');
+          let jobSkill = job.get('skill', '');
+          let sameDepartment = workerDepartment is string
+            && jobDepartment is string
+            && workerDepartment.trim().size() > 0
+            && jobDepartment.trim().size() > 0
+            && workerDepartment.trim().lower() == jobDepartment.trim().lower();
+          let missingDepartment = !(workerDepartment is string)
+            || workerDepartment.trim().size() == 0
+            || !(jobDepartment is string)
+            || jobDepartment.trim().size() == 0;
+          let sameSkill = workerSkill is string
+            && jobSkill is string
+            && workerSkill.trim().size() > 0
+            && workerSkill.trim().lower() == jobSkill.trim().lower();
+          return sameDepartment || (missingDepartment && sameSkill);
+        }
+
+        function isJobEmployer() {
+          return signedIn()
+            && get(jobPath()).data.employerUid == request.auth.uid;
+        }
+
+        allow read: if signedIn()
+          && (isJobEmployer()
+            || request.auth.uid == workerUid
+            || resource.data.workerUid == request.auth.uid);
+
+        allow create: if hasRole('worker')
+          && request.auth.uid == workerUid
+          && request.resource.data.workerUid == workerUid
+          && request.resource.data.status == 'applied'
+          && get(jobPath()).data.status == 'open'
+          // Match the same case-insensitive department/legacy-skill fallback
+          // used by the worker's job list.
+          && workerMatchesJobDepartment()
+          && request.resource.data.keys().hasOnly([
+            'workerUid', 'workerName', 'department', 'skill', 'location',
+            'jobTitle', 'jobLocation', 'wage', 'status', 'createdAt'
+          ]);
+
+        allow update: if isJobEmployer()
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status', 'updatedAt'])
+          && ((resource.data.status == 'applied'
+              && request.resource.data.status in ['accepted', 'rejected']
+              && (request.resource.data.status != 'accepted'
+                || (getAfter(jobPath()).data.status == 'assigned'
+                  && getAfter(jobPath()).data.acceptedWorkerUid == workerUid)))
+            || (resource.data.status == 'accepted'
+              && request.resource.data.status == 'completed'
+              && getAfter(jobPath()).data.status == 'completed'
+              && getAfter(jobPath()).data.acceptedWorkerUid == workerUid));
+
+        allow delete: if false;
+      }
+    }
+  }
+}
